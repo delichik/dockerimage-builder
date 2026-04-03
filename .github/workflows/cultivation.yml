@@ -1,0 +1,116 @@
+name: Build Cultivation Images
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: https://github.com/4thfever/cultivation-world-simulator.git
+  IMAGE_BACKEND: ghcr.io/${{ github.repository_owner }}/cultivation-backend
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository_owner }}/cultivation-frontend
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get latest upstream commit
+        id: upstream
+        run: |
+          COMMIT=$(git ls-remote ${{ env.UPSTREAM_REPO }} refs/heads/main | awk '{print $1}')
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Check if images already exist
+        id: check
+        env:
+          TAG: ${{ steps.upstream.outputs.commit }}
+          IMAGE_BACKEND: ${{ env.IMAGE_BACKEND }}
+          IMAGE_FRONTEND: ${{ env.IMAGE_FRONTEND }}
+        run: |
+          BE_EXISTS=false
+          FE_EXISTS=false
+          if docker manifest inspect "${IMAGE_BACKEND}:${TAG}" > /dev/null 2>&1; then BE_EXISTS=true; fi
+          if docker manifest inspect "${IMAGE_FRONTEND}:${TAG}" > /dev/null 2>&1; then FE_EXISTS=true; fi
+          echo "backend_exists=$BE_EXISTS" >> $GITHUB_OUTPUT
+          echo "frontend_exists=$FE_EXISTS" >> $GITHUB_OUTPUT
+          if [ "$BE_EXISTS" = "true" ] && [ "$FE_EXISTS" = "true" ]; then
+            echo "skip_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_build=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Stop if images already built
+        if: steps.check.outputs.skip_build == 'true'
+        run: |
+          echo "Both backend and frontend images already exist for this commit. Skip build."
+          exit 0
+
+      - name: Clone upstream (cultivation-world-simulator)
+        if: steps.check.outputs.skip_build != 'true'
+        run: |
+          git clone ${{ env.UPSTREAM_REPO }} cultivation
+          cd cultivation
+          git checkout ${{ steps.upstream.outputs.commit }}
+
+      - name: Login to GHCR
+        if: steps.check.outputs.skip_build != 'true'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build backend image
+        if: steps.check.outputs.skip_build != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.commit }}
+        run: |
+          cd cultivation
+          docker build \
+            -f deploy/Dockerfile.backend \
+            -t ${{ env.IMAGE_BACKEND }}:$TAG \
+            -t ${{ env.IMAGE_BACKEND }}:latest \
+            .
+
+      - name: Build frontend image
+        if: steps.check.outputs.skip_build != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.commit }}
+        run: |
+          cd cultivation
+          docker build \
+            -f deploy/Dockerfile.frontend \
+            -t ${{ env.IMAGE_FRONTEND }}:$TAG \
+            -t ${{ env.IMAGE_FRONTEND }}:latest \
+            .
+
+      - name: Push images
+        if: steps.check.outputs.skip_build != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.commit }}
+        run: |
+          docker push ${{ env.IMAGE_BACKEND }}:$TAG
+          docker push ${{ env.IMAGE_BACKEND }}:latest
+          docker push ${{ env.IMAGE_FRONTEND }}:$TAG
+          docker push ${{ env.IMAGE_FRONTEND }}:latest
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Delete old backend images (keep 2)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: cultivation-backend
+          package-type: container
+          min-versions-to-keep: 2
+
+      - name: Delete old frontend images (keep 2)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: cultivation-frontend
+          package-type: container
+          min-versions-to-keep: 2
