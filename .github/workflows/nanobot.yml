@@ -13,8 +13,13 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/nanobot
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.upstream.outputs.commit }}
+      amd64_exists: ${{ steps.check.outputs.amd64_exists }}
+      arm64_exists: ${{ steps.check.outputs.arm64_exists }}
+      manifest_exists: ${{ steps.check.outputs.manifest_exists }}
 
     steps:
       - name: Get latest upstream commit
@@ -23,57 +28,246 @@ jobs:
           COMMIT=$(git ls-remote https://github.com/HKUDS/nanobot.git refs/heads/main | awk '{print $1}')
           echo "commit=$COMMIT" >> $GITHUB_OUTPUT
 
-      - name: Check if image already exists
+      - name: Check existing images
         id: check
         run: |
           TAG=${{ steps.upstream.outputs.commit }}
-
-          if docker manifest inspect $IMAGE_NAME:$TAG > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+          if docker manifest inspect "$IMAGE_NAME:$TAG-amd64" > /dev/null 2>&1; then
+            echo "amd64_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "amd64_exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Stop if image already built
-        if: steps.check.outputs.exists == 'true'
-        run: |
-          echo "Image already exists. Skip build."
-          exit 0
+          if docker manifest inspect "$IMAGE_NAME:$TAG-arm64" > /dev/null 2>&1; then
+            echo "arm64_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "arm64_exists=false" >> $GITHUB_OUTPUT
+          fi
 
+          if docker manifest inspect "$IMAGE_NAME:$TAG" > /dev/null 2>&1; then
+            echo "manifest_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "manifest_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-amd64:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.amd64_exists != 'true'
+
+    steps:
       - name: Clone nanobot
         run: |
           git clone https://github.com/HKUDS/nanobot.git
           cd nanobot
-          git checkout ${{ steps.upstream.outputs.commit }}
+          git checkout ${{ needs.prepare.outputs.commit }}
 
       - name: Login to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build image
+      - name: Build amd64 image (native runner)
         run: |
-          TAG=${{ steps.upstream.outputs.commit }}
-
+          TAG=${{ needs.prepare.outputs.commit }}
           docker build \
-            -t $IMAGE_NAME:$TAG \
-            -t $IMAGE_NAME:latest \
+            --platform linux/amd64 \
+            -t "$IMAGE_NAME:$TAG-amd64" \
             nanobot
+          docker push "$IMAGE_NAME:$TAG-amd64"
 
-      - name: Push image
-        run: |
-          TAG=${{ steps.upstream.outputs.commit }}
-
-          docker push $IMAGE_NAME:$TAG
-          docker push $IMAGE_NAME:latest
-
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: build
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    needs: prepare
+    if: needs.prepare.outputs.arm64_exists != 'true'
 
     steps:
-      - name: Delete old images (keep 3)
+      - name: Clone nanobot
+        run: |
+          git clone https://github.com/HKUDS/nanobot.git
+          cd nanobot
+          git checkout ${{ needs.prepare.outputs.commit }}
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build arm64 image (native runner)
+        run: |
+          TAG=${{ needs.prepare.outputs.commit }}
+          docker build \
+            --platform linux/arm64 \
+            -t "$IMAGE_NAME:$TAG-arm64" \
+            nanobot
+          docker push "$IMAGE_NAME:$TAG-arm64"
+
+  publish-manifest:
+    runs-on: ubuntu-latest
+    needs: [prepare, build-amd64, build-arm64]
+    if: always() && needs.prepare.outputs.manifest_exists != 'true' && (needs.build-amd64.result == 'success' || needs.build-amd64.result == 'skipped') && (needs.build-arm64.result == 'success' || needs.build-arm64.result == 'skipped')
+
+    steps:
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Create and push multi-arch manifest
+        run: |
+          TAG=${{ needs.prepare.outputs.commit }}
+
+          docker manifest create "$IMAGE_NAME:$TAG" \
+            --amend "$IMAGE_NAME:$TAG-amd64" \
+            --amend "$IMAGE_NAME:$TAG-arm64"
+          docker manifest push "$IMAGE_NAME:$TAG"
+
+          docker manifest create "$IMAGE_NAME:latest" \
+            --amend "$IMAGE_NAME:$TAG-amd64" \
+            --amend "$IMAGE_NAME:$TAG-arm64"
+          docker manifest push "$IMAGE_NAME:latest"
+
+  cleanup-amd64:
+    runs-on: ubuntu-latest
+    needs: publish-manifest
+    if: always() && (needs.publish-manifest.result == 'success' || needs.publish-manifest.result == 'skipped')
+
+    steps:
+      - name: Cleanup amd64 tags (keep 3)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: nanobot
+          KEEP_COUNT: 3
+          ARCH_SUFFIX: -amd64
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          owner = os.environ["OWNER"]
+          package = os.environ["PACKAGE_NAME"]
+          keep_count = int(os.environ["KEEP_COUNT"])
+          suffix = os.environ["ARCH_SUFFIX"]
+
+          versions = None
+          for endpoint in (
+            f"/orgs/{owner}/packages/container/{package}/versions?per_page=100",
+            f"/users/{owner}/packages/container/{package}/versions?per_page=100",
+          ):
+            try:
+              raw = subprocess.check_output(["gh", "api", endpoint, "--paginate", "--slurp"], text=True)
+              pages = json.loads(raw)
+              versions = [item for page in pages for item in page]
+              break
+            except subprocess.CalledProcessError:
+              continue
+
+          if versions is None:
+            raise RuntimeError("Failed to list package versions from org/user endpoints.")
+
+          matched = []
+          for version in versions:
+            tags = version.get("metadata", {}).get("container", {}).get("tags", [])
+            if any(tag.endswith(suffix) for tag in tags):
+              matched.append(version)
+
+          matched.sort(key=lambda v: v["created_at"], reverse=True)
+          to_delete = matched[keep_count:]
+
+          for version in to_delete:
+            vid = version["id"]
+            deleted = False
+            for endpoint in (
+              f"/orgs/{owner}/packages/container/{package}/versions/{vid}",
+              f"/users/{owner}/packages/container/{package}/versions/{vid}",
+            ):
+              try:
+                subprocess.run(["gh", "api", "-X", "DELETE", endpoint], check=True)
+                deleted = True
+                break
+              except subprocess.CalledProcessError:
+                continue
+            if not deleted:
+              raise RuntimeError(f"Failed to delete version id={vid}")
+            print(f"Deleted version id={vid}")
+          PY
+
+  cleanup-arm64:
+    runs-on: ubuntu-latest
+    needs: publish-manifest
+    if: always() && (needs.publish-manifest.result == 'success' || needs.publish-manifest.result == 'skipped')
+
+    steps:
+      - name: Cleanup arm64 tags (keep 3)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE_NAME: nanobot
+          KEEP_COUNT: 3
+          ARCH_SUFFIX: -arm64
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import subprocess
+
+          owner = os.environ["OWNER"]
+          package = os.environ["PACKAGE_NAME"]
+          keep_count = int(os.environ["KEEP_COUNT"])
+          suffix = os.environ["ARCH_SUFFIX"]
+
+          versions = None
+          for endpoint in (
+            f"/orgs/{owner}/packages/container/{package}/versions?per_page=100",
+            f"/users/{owner}/packages/container/{package}/versions?per_page=100",
+          ):
+            try:
+              raw = subprocess.check_output(["gh", "api", endpoint, "--paginate", "--slurp"], text=True)
+              pages = json.loads(raw)
+              versions = [item for page in pages for item in page]
+              break
+            except subprocess.CalledProcessError:
+              continue
+
+          if versions is None:
+            raise RuntimeError("Failed to list package versions from org/user endpoints.")
+
+          matched = []
+          for version in versions:
+            tags = version.get("metadata", {}).get("container", {}).get("tags", [])
+            if any(tag.endswith(suffix) for tag in tags):
+              matched.append(version)
+
+          matched.sort(key=lambda v: v["created_at"], reverse=True)
+          to_delete = matched[keep_count:]
+
+          for version in to_delete:
+            vid = version["id"]
+            deleted = False
+            for endpoint in (
+              f"/orgs/{owner}/packages/container/{package}/versions/{vid}",
+              f"/users/{owner}/packages/container/{package}/versions/{vid}",
+            ):
+              try:
+                subprocess.run(["gh", "api", "-X", "DELETE", endpoint], check=True)
+                deleted = True
+                break
+              except subprocess.CalledProcessError:
+                continue
+            if not deleted:
+              raise RuntimeError(f"Failed to delete version id={vid}")
+            print(f"Deleted version id={vid}")
+          PY
+
+  cleanup-manifest:
+    runs-on: ubuntu-latest
+    needs: publish-manifest
+    if: always() && (needs.publish-manifest.result == 'success' || needs.publish-manifest.result == 'skipped')
+
+    steps:
+      - name: Delete old manifest tags (keep 3)
         uses: actions/delete-package-versions@v5
         with:
           package-name: nanobot
           package-type: container
           min-versions-to-keep: 3
+          ignore-versions: '.*-(amd64|arm64)$'
